@@ -4,21 +4,53 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"os"
 	"time"
 
-	"github.com/99designs/aws-vault/prompt"
+	"github.com/99designs/aws-vault/v6/prompt"
+	"github.com/99designs/keyring"
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/aws/credentials"
+	"github.com/aws/aws-sdk-go/aws/endpoints"
 	"github.com/aws/aws-sdk-go/aws/session"
+	"github.com/aws/aws-sdk-go/service/sso"
+	"github.com/aws/aws-sdk-go/service/ssooidc"
 	"github.com/aws/aws-sdk-go/service/sts"
 )
 
-const defaultExpirationWindow = 5 * time.Minute
+var defaultExpirationWindow = 5 * time.Minute
+
+func init() {
+	if d, err := time.ParseDuration(os.Getenv("AWS_MIN_TTL")); err == nil {
+		defaultExpirationWindow = d
+	}
+}
 
 var UseSessionCache = true
 
-func NewSession(creds *credentials.Credentials, region string) (*session.Session, error) {
-	return session.NewSession(aws.NewConfig().WithRegion(region).WithCredentials(creds))
+func NewSession(region, stsRegionalEndpoints string) (*session.Session, error) {
+	endpointConfig, err := endpoints.GetSTSRegionalEndpoint(stsRegionalEndpoints)
+	if err != nil && stsRegionalEndpoints != "" {
+		return nil, err
+	}
+
+	return session.NewSessionWithOptions(session.Options{
+		Config: aws.Config{
+			Region:              aws.String(region),
+			STSRegionalEndpoint: endpointConfig,
+		},
+		SharedConfigState: session.SharedConfigDisable,
+	})
+}
+
+func NewSessionWithCreds(creds *credentials.Credentials, region, stsRegionalEndpoints string) (*session.Session, error) {
+	s, err := NewSession(region, stsRegionalEndpoints)
+	if err != nil {
+		return nil, err
+	}
+	s.Config.Credentials = creds
+
+	return s, nil
 }
 
 func FormatKeyForDisplay(k string) string {
@@ -40,7 +72,7 @@ func (m *Mfa) GetMfaToken() (*string, error) {
 
 	if m.MfaPromptMethod != "" {
 		promptFunc := prompt.Method(m.MfaPromptMethod)
-		token, err := promptFunc(fmt.Sprintf("Enter token for %s: ", m.MfaSerial))
+		token, err := promptFunc(m.MfaSerial)
 		return aws.String(token), err
 	}
 
@@ -56,8 +88,8 @@ func NewMasterCredentials(k *CredentialKeyring, credentialsName string) *credent
 	return credentials.NewCredentials(NewMasterCredentialsProvider(k, credentialsName))
 }
 
-func NewSessionTokenProvider(creds *credentials.Credentials, k *CredentialKeyring, config *Config) (credentials.Provider, error) {
-	sess, err := NewSession(creds, config.Region)
+func NewSessionTokenProvider(creds *credentials.Credentials, k keyring.Keyring, config *Config) (credentials.Provider, error) {
+	sess, err := NewSessionWithCreds(creds, config.Region, config.STSRegionalEndpoints)
 	if err != nil {
 		return nil, err
 	}
@@ -74,11 +106,15 @@ func NewSessionTokenProvider(creds *credentials.Credentials, k *CredentialKeyrin
 	}
 
 	if UseSessionCache {
-		return &CachedSessionTokenProvider{
-			Keyring:         k,
-			CredentialsName: config.ProfileName,
+		return &CachedSessionProvider{
+			SessionKey: SessionMetadata{
+				Type:        "sts.GetSessionToken",
+				ProfileName: config.ProfileName,
+				MfaSerial:   config.MfaSerial,
+			},
+			Keyring:         &SessionKeyring{Keyring: k},
 			ExpiryWindow:    defaultExpirationWindow,
-			Provider:        sessionTokenProvider,
+			CredentialsFunc: sessionTokenProvider.GetSessionToken,
 		}, nil
 	}
 
@@ -86,13 +122,13 @@ func NewSessionTokenProvider(creds *credentials.Credentials, k *CredentialKeyrin
 }
 
 // NewAssumeRoleProvider returns a provider that generates credentials using AssumeRole
-func NewAssumeRoleProvider(creds *credentials.Credentials, config *Config) (*AssumeRoleProvider, error) {
-	sess, err := NewSession(creds, config.Region)
+func NewAssumeRoleProvider(creds *credentials.Credentials, k keyring.Keyring, config *Config) (credentials.Provider, error) {
+	sess, err := NewSessionWithCreds(creds, config.Region, config.STSRegionalEndpoints)
 	if err != nil {
 		return nil, err
 	}
 
-	return &AssumeRoleProvider{
+	p := &AssumeRoleProvider{
 		StsClient:       sts.New(sess),
 		RoleARN:         config.RoleARN,
 		RoleSessionName: config.RoleSessionName,
@@ -104,7 +140,88 @@ func NewAssumeRoleProvider(creds *credentials.Credentials, config *Config) (*Ass
 			MfaToken:        config.MfaToken,
 			MfaPromptMethod: config.MfaPromptMethod,
 		},
-	}, nil
+	}
+
+	if UseSessionCache && config.MfaSerial != "" {
+		return &CachedSessionProvider{
+			SessionKey: SessionMetadata{
+				Type:        "sts.AssumeRole",
+				ProfileName: config.ProfileName,
+				MfaSerial:   config.MfaSerial,
+			},
+			Keyring:         &SessionKeyring{Keyring: k},
+			ExpiryWindow:    defaultExpirationWindow,
+			CredentialsFunc: p.assumeRole,
+		}, nil
+	}
+
+	return p, nil
+}
+
+// NewAssumeRoleWithWebIdentityProvider returns a provider that generates
+// credentials using AssumeRoleWithWebIdentity
+func NewAssumeRoleWithWebIdentityProvider(k keyring.Keyring, config *Config) (credentials.Provider, error) {
+	sess, err := NewSession(config.Region, config.STSRegionalEndpoints)
+	if err != nil {
+		return nil, err
+	}
+
+	p := &AssumeRoleWithWebIdentityProvider{
+		StsClient:               sts.New(sess),
+		RoleARN:                 config.RoleARN,
+		RoleSessionName:         config.RoleSessionName,
+		WebIdentityTokenFile:    config.WebIdentityTokenFile,
+		WebIdentityTokenProcess: config.WebIdentityTokenProcess,
+		Duration:                config.AssumeRoleDuration,
+		ExpiryWindow:            defaultExpirationWindow,
+	}
+
+	if UseSessionCache {
+		return &CachedSessionProvider{
+			SessionKey: SessionMetadata{
+				Type:        "sts.AssumeRoleWithWebIdentity",
+				ProfileName: config.ProfileName,
+			},
+			Keyring:         &SessionKeyring{Keyring: k},
+			ExpiryWindow:    defaultExpirationWindow,
+			CredentialsFunc: p.assumeRole,
+		}, nil
+	}
+
+	return p, nil
+}
+
+// NewSSORoleCredentialsProvider creates a provider for SSO credentials
+func NewSSORoleCredentialsProvider(k keyring.Keyring, config *Config) (credentials.Provider, error) {
+	sess, err := NewSession(config.SSORegion, config.STSRegionalEndpoints)
+	if err != nil {
+		return nil, err
+	}
+
+	ssoRoleCredentialsProvider := &SSORoleCredentialsProvider{
+		OIDCClient:   ssooidc.New(sess),
+		StartURL:     config.SSOStartURL,
+		SSOClient:    sso.New(sess),
+		AccountID:    config.SSOAccountID,
+		RoleName:     config.SSORoleName,
+		ExpiryWindow: defaultExpirationWindow,
+	}
+
+	if UseSessionCache {
+		ssoRoleCredentialsProvider.OIDCTokenCache = OIDCTokenKeyring{Keyring: k}
+		return &CachedSessionProvider{
+			SessionKey: SessionMetadata{
+				Type:        "sso.GetRoleCredentials",
+				ProfileName: config.ProfileName,
+				MfaSerial:   config.SSOStartURL,
+			},
+			Keyring:         &SessionKeyring{Keyring: k},
+			ExpiryWindow:    defaultExpirationWindow,
+			CredentialsFunc: ssoRoleCredentialsProvider.getRoleCredentialsAsStsCredemtials,
+		}, nil
+	}
+
+	return ssoRoleCredentialsProvider, nil
 }
 
 type tempCredsCreator struct {
@@ -130,6 +247,10 @@ func (t *tempCredsCreator) provider(config *Config) (credentials.Provider, error
 		if err != nil {
 			return nil, err
 		}
+	} else if config.HasSSOStartURL() {
+		return NewSSORoleCredentialsProvider(t.keyring.Keyring, config)
+	} else if config.HasRole() && (config.HasWebIdentityTokenFile() || config.HasWebIdentityTokenProcess()) {
+		return NewAssumeRoleWithWebIdentityProvider(t.keyring.Keyring, config)
 	} else {
 		return nil, fmt.Errorf("profile %s: credentials missing", config.ProfileName)
 	}
@@ -144,7 +265,7 @@ func (t *tempCredsCreator) provider(config *Config) (credentials.Provider, error
 
 		t.chainedMfa = config.MfaSerial
 		log.Printf("profile %s: using GetSessionToken %s", config.ProfileName, mfaDetails(false, config))
-		sourceCredProvider, err = NewSessionTokenProvider(credentials.NewCredentials(sourceCredProvider), t.keyring, config)
+		sourceCredProvider, err = NewSessionTokenProvider(credentials.NewCredentials(sourceCredProvider), t.keyring.Keyring, config)
 		if !config.HasRole() || err != nil {
 			return sourceCredProvider, err
 		}
@@ -156,7 +277,7 @@ func (t *tempCredsCreator) provider(config *Config) (credentials.Provider, error
 	}
 
 	log.Printf("profile %s: using AssumeRole %s", config.ProfileName, mfaDetails(isMfaChained, config))
-	return NewAssumeRoleProvider(credentials.NewCredentials(sourceCredProvider), config)
+	return NewAssumeRoleProvider(credentials.NewCredentials(sourceCredProvider), t.keyring.Keyring, config)
 }
 
 func mfaDetails(mfaChained bool, config *Config) string {
@@ -193,7 +314,8 @@ func NewFederationTokenCredentials(profileName string, k *CredentialKeyring, con
 		return nil, err
 	}
 
-	sess, err := NewSession(NewMasterCredentials(k, credentialsName), config.Region)
+	masterCreds := NewMasterCredentials(k, credentialsName)
+	sess, err := NewSessionWithCreds(masterCreds, config.Region, config.STSRegionalEndpoints)
 	if err != nil {
 		return nil, err
 	}
@@ -219,6 +341,10 @@ func MasterCredentialsFor(profileName string, keyring *CredentialKeyring, config
 
 	if hasMasterCreds {
 		return profileName, nil
+	}
+
+	if profileName == config.SourceProfileName {
+		return "", fmt.Errorf("No master credentials found")
 	}
 
 	return MasterCredentialsFor(config.SourceProfileName, keyring, config)

@@ -8,7 +8,7 @@ import (
 	"reflect"
 	"testing"
 
-	"github.com/99designs/aws-vault/vault"
+	"github.com/99designs/aws-vault/v6/vault"
 	"github.com/google/go-cmp/cmp"
 )
 
@@ -28,16 +28,17 @@ region=us-east-1
 
 [profile withMFA]
 source_profile=user2
-role_arn=arn:aws:iam::4451234513441615400570:role/aws_admin
+Role_Arn=arn:aws:iam::4451234513441615400570:role/aws_admin
 mfa_Serial=arn:aws:iam::1234513441:mfa/blah
-region=us-east-1
+Region=us-east-1
 duration_seconds=1200
+sts_regional_endpoints=legacy
 
-[profile testparentprofile1]
+[profile testincludeprofile1]
 region=us-east-1
 
-[profile testparentprofile2]
-parent_profile=testparentprofile1
+[profile testincludeprofile2]
+include_profile=testincludeprofile1
 `)
 
 var nestedConfig = []byte(`[default]
@@ -57,11 +58,6 @@ output=json
 
 `)
 
-var defaultsOnlyConfigWithoutHeader = []byte(`region=us-west-2
-output=json
-
-`)
-
 func newConfigFile(t *testing.T, b []byte) string {
 	f, err := ioutil.TempFile("", "aws-config")
 	if err != nil {
@@ -73,7 +69,7 @@ func newConfigFile(t *testing.T, b []byte) string {
 	return f.Name()
 }
 
-func TestConfigCaseInsensitivity(t *testing.T) {
+func TestProfileNameCaseSensitivity(t *testing.T) {
 	f := newConfigFile(t, exampleConfig)
 	defer os.Remove(f)
 
@@ -82,7 +78,7 @@ func TestConfigCaseInsensitivity(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	def, ok := cfg.ProfileSection("withmfa")
+	def, ok := cfg.ProfileSection("withMFA")
 	if !ok {
 		t.Fatalf("Expected to match profile withMFA")
 	}
@@ -108,7 +104,7 @@ func TestConfigParsingProfiles(t *testing.T) {
 	}{
 		{vault.ProfileSection{Name: "user2", Region: "us-east-1"}, true},
 		{vault.ProfileSection{Name: "withsource", SourceProfile: "user2", Region: "us-east-1"}, true},
-		{vault.ProfileSection{Name: "withmfa", MfaSerial: "arn:aws:iam::1234513441:mfa/blah", RoleARN: "arn:aws:iam::4451234513441615400570:role/aws_admin", Region: "us-east-1", DurationSeconds: 1200, SourceProfile: "user2"}, true},
+		{vault.ProfileSection{Name: "withMFA", MfaSerial: "arn:aws:iam::1234513441:mfa/blah", RoleARN: "arn:aws:iam::4451234513441615400570:role/aws_admin", Region: "us-east-1", DurationSeconds: 1200, SourceProfile: "user2", STSRegionalEndpoints: "legacy"}, true},
 		{vault.ProfileSection{Name: "nopenotthere"}, false},
 	}
 
@@ -159,12 +155,12 @@ func TestProfilesFromConfig(t *testing.T) {
 	}
 
 	expected := []vault.ProfileSection{
-		vault.ProfileSection{Name: "default", Region: "us-west-2"},
-		vault.ProfileSection{Name: "user2", Region: "us-east-1"},
-		vault.ProfileSection{Name: "withsource", Region: "us-east-1", SourceProfile: "user2"},
-		vault.ProfileSection{Name: "withmfa", MfaSerial: "arn:aws:iam::1234513441:mfa/blah", RoleARN: "arn:aws:iam::4451234513441615400570:role/aws_admin", Region: "us-east-1", DurationSeconds: 1200, SourceProfile: "user2"},
-		vault.ProfileSection{Name: "testparentprofile1", Region: "us-east-1"},
-		vault.ProfileSection{Name: "testparentprofile2", ParentProfile: "testparentprofile1"},
+		{Name: "default", Region: "us-west-2"},
+		{Name: "user2", Region: "us-east-1"},
+		{Name: "withsource", Region: "us-east-1", SourceProfile: "user2"},
+		{Name: "withMFA", MfaSerial: "arn:aws:iam::1234513441:mfa/blah", RoleARN: "arn:aws:iam::4451234513441615400570:role/aws_admin", Region: "us-east-1", DurationSeconds: 1200, SourceProfile: "user2", STSRegionalEndpoints: "legacy"},
+		{Name: "testincludeprofile1", Region: "us-east-1"},
+		{Name: "testincludeprofile2", IncludeProfile: "testincludeprofile1"},
 	}
 	actual := cfg.ProfileSections()
 
@@ -193,13 +189,13 @@ func TestAddProfileToExistingConfig(t *testing.T) {
 	}
 
 	expected := []vault.ProfileSection{
-		vault.ProfileSection{Name: "default", Region: "us-west-2"},
-		vault.ProfileSection{Name: "user2", Region: "us-east-1"},
-		vault.ProfileSection{Name: "withsource", Region: "us-east-1", SourceProfile: "user2"},
-		vault.ProfileSection{Name: "withmfa", MfaSerial: "arn:aws:iam::1234513441:mfa/blah", RoleARN: "arn:aws:iam::4451234513441615400570:role/aws_admin", Region: "us-east-1", DurationSeconds: 1200, SourceProfile: "user2"},
-		vault.ProfileSection{Name: "testparentprofile1", Region: "us-east-1"},
-		vault.ProfileSection{Name: "testparentprofile2", ParentProfile: "testparentprofile1"},
-		vault.ProfileSection{Name: "llamas", MfaSerial: "testserial", Region: "us-east-1", SourceProfile: "default"},
+		{Name: "default", Region: "us-west-2"},
+		{Name: "user2", Region: "us-east-1"},
+		{Name: "withsource", Region: "us-east-1", SourceProfile: "user2"},
+		{Name: "withMFA", MfaSerial: "arn:aws:iam::1234513441:mfa/blah", RoleARN: "arn:aws:iam::4451234513441615400570:role/aws_admin", Region: "us-east-1", DurationSeconds: 1200, SourceProfile: "user2", STSRegionalEndpoints: "legacy"},
+		{Name: "testincludeprofile1", Region: "us-east-1"},
+		{Name: "testincludeprofile2", IncludeProfile: "testincludeprofile1"},
+		{Name: "llamas", MfaSerial: "testserial", Region: "us-east-1", SourceProfile: "default"},
 	}
 	actual := cfg.ProfileSections()
 
@@ -238,7 +234,7 @@ func TestAddProfileToExistingNestedConfig(t *testing.T) {
 
 }
 
-func TestParentProfile(t *testing.T) {
+func TestIncludeProfile(t *testing.T) {
 	f := newConfigFile(t, exampleConfig)
 	defer os.Remove(f)
 
@@ -248,7 +244,7 @@ func TestParentProfile(t *testing.T) {
 	}
 
 	configLoader := &vault.ConfigLoader{File: configFile}
-	config, err := configLoader.LoadFromProfile("testparentprofile2")
+	config, err := configLoader.LoadFromProfile("testincludeprofile2")
 	if err != nil {
 		t.Fatalf("Should have found a profile: %v", err)
 	}
@@ -289,25 +285,95 @@ func TestIniWithHeaderSavesWithHeader(t *testing.T) {
 
 }
 
-func TestIniWithoutHeaderSavesWithHeader(t *testing.T) {
-	f := newConfigFile(t, defaultsOnlyConfigWithoutHeader)
+func TestIniWithDEFAULTHeader(t *testing.T) {
+	f := newConfigFile(t, []byte(`[DEFAULT]
+region=us-east-1
+[default]
+region=us-west-2
+`))
 	defer os.Remove(f)
 
 	cfg, err := vault.LoadConfig(f)
 	if err != nil {
 		t.Fatal(err)
 	}
+	expected := []vault.ProfileSection{
+		{Name: "default", Region: "us-west-2"},
+	}
+	actual := cfg.ProfileSections()
 
-	err = cfg.Save()
+	if diff := cmp.Diff(expected, actual); diff != "" {
+		t.Errorf("ProfileSections() mismatch (-expected +actual):\n%s", diff)
+	}
+}
+
+func TestLoadedProfileDoesntReferToItself(t *testing.T) {
+	f := newConfigFile(t, []byte(`
+[profile foo]
+source_profile=foo
+`))
+	defer os.Remove(f)
+
+	configFile, err := vault.LoadConfig(f)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	expected := defaultsOnlyConfigWithHeader
+	def, ok := configFile.ProfileSection("foo")
+	if !ok {
+		t.Fatalf("Couldn't load profile foo")
+	}
 
-	b, _ := ioutil.ReadFile(f)
+	expectedSourceProfile := "foo"
+	if def.SourceProfile != expectedSourceProfile {
+		t.Fatalf("Expected '%s', got '%s'", expectedSourceProfile, def.SourceProfile)
+	}
 
-	if !bytes.Equal(expected, b) {
-		t.Fatalf("Expected:\n%q\nGot:\n%q", expected, b)
+	configLoader := &vault.ConfigLoader{File: configFile}
+	config, err := configLoader.LoadFromProfile("foo")
+	if err != nil {
+		t.Fatalf("Should have found a profile: %v", err)
+	}
+
+	expectedSourceProfileName := ""
+	if config.SourceProfileName != expectedSourceProfileName {
+		t.Fatalf("Expected '%s', got '%s'", expectedSourceProfileName, config.SourceProfileName)
+	}
+}
+
+func TestSourceProfileCanReferToParent(t *testing.T) {
+	f := newConfigFile(t, []byte(`
+[profile root]
+
+[profile foo]
+include_profile=root
+source_profile=root
+`))
+	defer os.Remove(f)
+
+	configFile, err := vault.LoadConfig(f)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	def, ok := configFile.ProfileSection("foo")
+	if !ok {
+		t.Fatalf("Couldn't load profile foo")
+	}
+
+	expectedSourceProfile := "root"
+	if def.SourceProfile != expectedSourceProfile {
+		t.Fatalf("Expected '%s', got '%s'", expectedSourceProfile, def.SourceProfile)
+	}
+
+	configLoader := &vault.ConfigLoader{File: configFile}
+	config, err := configLoader.LoadFromProfile("foo")
+	if err != nil {
+		t.Fatalf("Should have found a profile: %v", err)
+	}
+
+	expectedSourceProfileName := "root"
+	if config.SourceProfileName != expectedSourceProfileName {
+		t.Fatalf("Expected '%s', got '%s'", expectedSourceProfileName, config.SourceProfileName)
 	}
 }

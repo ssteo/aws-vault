@@ -28,7 +28,6 @@ const (
 var UseSession = true
 
 func init() {
-	ini.DefaultHeader = true
 	ini.PrettyFormat = false
 }
 
@@ -114,12 +113,14 @@ func LoadConfigFromEnv() (*ConfigFile, error) {
 
 func (c *ConfigFile) parseFile() error {
 	log.Printf("Parsing config file %s", c.Path)
+
 	f, err := ini.LoadSources(ini.LoadOptions{
-		AllowNestedValues: true,
-		Insensitive:       true,
+		AllowNestedValues:   true,
+		InsensitiveSections: false,
+		InsensitiveKeys:     true,
 	}, c.Path)
 	if err != nil {
-		return fmt.Errorf("Error parsing config file %q: %v", c.Path, err)
+		return fmt.Errorf("Error parsing config file %s: %w", c.Path, err)
 	}
 	c.iniFile = f
 	return nil
@@ -127,15 +128,23 @@ func (c *ConfigFile) parseFile() error {
 
 // ProfileSection is a profile section of the config file
 type ProfileSection struct {
-	Name            string `ini:"-"`
-	MfaSerial       string `ini:"mfa_serial,omitempty"`
-	RoleARN         string `ini:"role_arn,omitempty"`
-	ExternalID      string `ini:"external_id,omitempty"`
-	Region          string `ini:"region,omitempty"`
-	RoleSessionName string `ini:"role_session_name,omitempty"`
-	DurationSeconds uint   `ini:"duration_seconds,omitempty"`
-	SourceProfile   string `ini:"source_profile,omitempty"`
-	ParentProfile   string `ini:"parent_profile,omitempty"`
+	Name                    string `ini:"-"`
+	MfaSerial               string `ini:"mfa_serial,omitempty"`
+	RoleARN                 string `ini:"role_arn,omitempty"`
+	ExternalID              string `ini:"external_id,omitempty"`
+	Region                  string `ini:"region,omitempty"`
+	RoleSessionName         string `ini:"role_session_name,omitempty"`
+	DurationSeconds         uint   `ini:"duration_seconds,omitempty"`
+	SourceProfile           string `ini:"source_profile,omitempty"`
+	ParentProfile           string `ini:"parent_profile,omitempty"` // deprecated
+	IncludeProfile          string `ini:"include_profile,omitempty"`
+	SSOStartURL             string `ini:"sso_start_url,omitempty"`
+	SSORegion               string `ini:"sso_region,omitempty"`
+	SSOAccountID            string `ini:"sso_account_id,omitempty"`
+	SSORoleName             string `ini:"sso_role_name,omitempty"`
+	WebIdentityTokenFile    string `ini:"web_identity_token_file,omitempty"`
+	WebIdentityTokenProcess string `ini:"web_identity_token_process,omitempty"`
+	STSRegionalEndpoints    string `ini:"sts_regional_endpoints,omitempty"`
 }
 
 func (s ProfileSection) IsEmpty() bool {
@@ -152,7 +161,7 @@ func (c *ConfigFile) ProfileSections() []ProfileSection {
 	}
 
 	for _, section := range c.iniFile.SectionStrings() {
-		if strings.ToLower(section) != defaultSectionName && !strings.HasPrefix(section, "profile ") {
+		if section != defaultSectionName && !strings.HasPrefix(section, "profile ") {
 			log.Printf("Unrecognised ini file section: %s", section)
 			continue
 		}
@@ -296,8 +305,38 @@ func (cl *ConfigLoader) populateFromConfigFile(config *Config, profileName strin
 	if config.SourceProfileName == "" {
 		config.SourceProfileName = psection.SourceProfile
 	}
+	if config.SSOStartURL == "" {
+		config.SSOStartURL = psection.SSOStartURL
+	}
+	if config.SSORegion == "" {
+		config.SSORegion = psection.SSORegion
+	}
+	if config.SSOAccountID == "" {
+		config.SSOAccountID = psection.SSOAccountID
+	}
+	if config.SSORoleName == "" {
+		config.SSORoleName = psection.SSORoleName
+	}
+	if config.WebIdentityTokenFile == "" {
+		config.WebIdentityTokenFile = psection.WebIdentityTokenFile
+	}
+	if config.WebIdentityTokenProcess == "" {
+		config.WebIdentityTokenProcess = psection.WebIdentityTokenProcess
+	}
+	if config.STSRegionalEndpoints == "" {
+		config.STSRegionalEndpoints = psection.STSRegionalEndpoints
+	}
 
 	if psection.ParentProfile != "" {
+		fmt.Fprint(os.Stderr, "Warning: parent_profile is deprecated, please use include_profile instead in your AWS config\n")
+	}
+
+	if psection.IncludeProfile != "" {
+		err := cl.populateFromConfigFile(config, psection.IncludeProfile)
+		if err != nil {
+			return err
+		}
+	} else if psection.ParentProfile != "" {
 		err := cl.populateFromConfigFile(config, psection.ParentProfile)
 		if err != nil {
 			return err
@@ -307,6 +346,11 @@ func (cl *ConfigLoader) populateFromConfigFile(config *Config, profileName strin
 		if err != nil {
 			return err
 		}
+	}
+
+	// Ignore source_profile if it recursively refers to the profile
+	if config.SourceProfileName == config.ProfileName {
+		config.SourceProfileName = ""
 	}
 
 	return nil
@@ -321,6 +365,11 @@ func (cl *ConfigLoader) populateFromEnv(profile *Config) {
 	if region := os.Getenv("AWS_DEFAULT_REGION"); region != "" && profile.Region == "" {
 		log.Printf("Using region %q from AWS_DEFAULT_REGION", region)
 		profile.Region = region
+	}
+
+	if stsRegionalEndpoints := os.Getenv("AWS_STS_REGIONAL_ENDPOINTS"); stsRegionalEndpoints != "" && profile.STSRegionalEndpoints == "" {
+		log.Printf("Using %q from AWS_STS_REGIONAL_ENDPOINTS", stsRegionalEndpoints)
+		profile.STSRegionalEndpoints = stsRegionalEndpoints
 	}
 
 	if mfaSerial := os.Getenv("AWS_MFA_SERIAL"); mfaSerial != "" && profile.MfaSerial == "" {
@@ -351,9 +400,9 @@ func (cl *ConfigLoader) populateFromEnv(profile *Config) {
 	}
 
 	if federationTokenTTL := os.Getenv("AWS_FEDERATION_TOKEN_TTL"); federationTokenTTL != "" && profile.GetFederationTokenDuration == 0 {
-		profile.NonChainedGetSessionTokenDuration, err = time.ParseDuration(federationTokenTTL)
+		profile.GetFederationTokenDuration, err = time.ParseDuration(federationTokenTTL)
 		if err == nil {
-			log.Printf("Using a session duration of %q from AWS_FEDERATION_TOKEN_TTL", profile.NonChainedGetSessionTokenDuration)
+			log.Printf("Using a session duration of %q from AWS_FEDERATION_TOKEN_TTL", profile.GetFederationTokenDuration)
 		}
 	}
 
@@ -422,6 +471,9 @@ type Config struct {
 	// Region is the AWS region
 	Region string
 
+	// STSRegionalEndpoints sets STS endpoint resolution logic, must be "regional" or "legacy"
+	STSRegionalEndpoints string
+
 	// Mfa config
 	MfaSerial       string
 	MfaToken        string
@@ -431,6 +483,10 @@ type Config struct {
 	RoleARN         string
 	RoleSessionName string
 	ExternalID      string
+
+	// AssumeRoleWithWebIdentity config
+	WebIdentityTokenFile    string
+	WebIdentityTokenProcess string
 
 	// GetSessionTokenDuration specifies the wanted duration for credentials generated with AssumeRole
 	AssumeRoleDuration time.Duration
@@ -443,6 +499,18 @@ type Config struct {
 
 	// GetFederationTokenDuration specifies the wanted duration for credentials generated with GetFederationToken
 	GetFederationTokenDuration time.Duration
+
+	// SSOStartURL specifies the URL for the AWS SSO user portal.
+	SSOStartURL string
+
+	// SSORegion specifies the region for the AWS SSO user portal.
+	SSORegion string
+
+	// SSOAccountID specifies the AWS account ID for the profile.
+	SSOAccountID string
+
+	// SSORoleName specifies the AWS SSO Role name to target.
+	SSORoleName string
 }
 
 func (c *Config) IsChained() bool {
@@ -461,6 +529,18 @@ func (c *Config) HasRole() bool {
 	return c.RoleARN != ""
 }
 
+func (c *Config) HasSSOStartURL() bool {
+	return c.SSOStartURL != ""
+}
+
+func (c *Config) HasWebIdentityTokenFile() bool {
+	return c.WebIdentityTokenFile != ""
+}
+
+func (c *Config) HasWebIdentityTokenProcess() bool {
+	return c.WebIdentityTokenProcess != ""
+}
+
 // CanUseGetSessionToken determines if GetSessionToken should be used, and if not returns a reason
 func (c *Config) CanUseGetSessionToken() (bool, string) {
 	if !UseSession {
@@ -474,6 +554,10 @@ func (c *Config) CanUseGetSessionToken() (bool, string) {
 	} else if c.IsChained() {
 		if !c.ChainedFromProfile.HasMfaSerial() {
 			return false, fmt.Sprintf("profile '%s' has no MFA serial defined", c.ChainedFromProfile.ProfileName)
+		}
+
+		if !c.HasMfaSerial() && c.ChainedFromProfile.HasMfaSerial() {
+			return false, fmt.Sprintf("profile '%s' has no MFA serial defined", c.ProfileName)
 		}
 
 		if c.ChainedFromProfile.MfaSerial != c.MfaSerial {

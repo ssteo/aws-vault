@@ -1,10 +1,36 @@
 # AWS Vault
 
+[![Downloads](https://img.shields.io/github/downloads/99designs/aws-vault/total.svg)](https://github.com/99designs/aws-vault/releases)
+[![Go Report Card](https://goreportcard.com/badge/github.com/99designs/aws-vault)](https://goreportcard.com/report/github.com/99designs/aws-vault)
+[![Continuous Integration](https://github.com/99designs/aws-vault/workflows/Continuous%20Integration/badge.svg)](https://github.com/99designs/aws-vault/actions)
+
 AWS Vault is a tool to securely store and access AWS credentials in a development environment.
 
 AWS Vault stores IAM credentials in your operating system's secure keystore and then generates temporary credentials from those to expose to your shell and applications. It's designed to be complementary to the AWS CLI tools, and is aware of your [profiles and configuration in `~/.aws/config`](https://docs.aws.amazon.com/cli/latest/userguide/cli-chap-getting-started.html#cli-config-files).
 
-The supported backends are:
+Check out the [announcement blog post](https://99designs.com.au/tech-blog/blog/2015/10/26/aws-vault/) for more details.
+
+## Installing
+
+You can install AWS Vault:
+- by downloading the [latest release](https://github.com/99designs/aws-vault/releases/latest)
+- on macOS with [Homebrew Cask](https://formulae.brew.sh/cask/aws-vault): `brew cask install aws-vault`
+- on macOS with [MacPorts](https://ports.macports.org/port/aws-vault/summary): `port install aws-vault`
+- on Windows with [Chocolatey](https://chocolatey.org/packages/aws-vault): `choco install aws-vault`
+- on Windows with [Scoop](https://scoop.sh/): `scoop install aws-vault`
+- on Linux with [Homebrew on Linux](https://formulae.brew.sh/formula-linux/aws-vault): `brew install aws-vault`
+- on [Arch Linux](https://aur.archlinux.org/packages/aws-vault/): `yay -S aws-vault`
+- on [Void Linux](https://github.com/void-linux/void-packages/blob/master/srcpkgs/aws-vault/template): `xbps-install aws-vault`
+- on [FreeBSD](https://www.freshports.org/security/aws-vault/): `pkg install aws-vault`
+- with [Nix](https://nixos.org/nixos/packages.html?attr=aws-vault): `nix-env -i aws-vault`
+
+## Documentation
+
+Config, usage, tips and tricks are available in the [USAGE.md](./USAGE.md) file.
+
+## Vaulting Backends
+
+The supported vaulting backends are:
 
 * [macOS Keychain](https://support.apple.com/en-au/guide/keychain-access/welcome/mac)
 * [Windows Credential Manager](https://support.microsoft.com/en-au/help/4026814/windows-accessing-credential-manager)
@@ -13,23 +39,11 @@ The supported backends are:
 * [Pass](https://www.passwordstore.org/)
 * Encrypted file
 
-Check out the [announcement blog post](https://99designs.com.au/tech-blog/blog/2015/10/26/aws-vault/) for more details.
+Use the `--backend` flag or `AWS_VAULT_BACKEND` environment variable to specify.
 
+## Quick start
 
-## Installing
-
-You can install aws-vault:
-- by downloading the [latest release](https://github.com/99designs/aws-vault/releases)
-- on macOS via [Homebrew Cask](https://github.com/caskroom/homebrew-cask) with `brew cask install aws-vault`
-- on Linux via [Homebrew on Linux](https://docs.brew.sh/Homebrew-on-Linux) with `brew install aws-vault`
-- on Windows via [choco](https://chocolatey.org/packages/aws-vault) with `choco install aws-vault`
-- on Archlinux via the [AUR](https://aur.archlinux.org/packages/aws-vault/)
-- by compiling with `go get github.com/99designs/aws-vault`
-
-
-## Basic Usage
-
-```bash
+```shell
 # Store AWS credentials for the "jonsmith" profile
 $ aws-vault add jonsmith
 Enter Access Key Id: ABDCDEFDASDASF
@@ -49,27 +63,26 @@ Profile                  Credentials              Sessions
 =======                  ===========              ========
 jonsmith                 jonsmith                 -
 ```
-See the [USAGE](./USAGE.md) document for more help and tips.
 
+## How it works
 
-## Security
-```bash
-$ aws-vault exec jonsmith -- env | grep AWS
-AWS_VAULT=jonsmith
-AWS_REGION=us-east-1
-AWS_ACCESS_KEY_ID=%%%
-AWS_SECRET_ACCESS_KEY=%%%
-AWS_SESSION_TOKEN=%%%
-AWS_SECURITY_TOKEN=%%%
-```
+`aws-vault` uses Amazon's STS service to generate [temporary credentials](https://docs.aws.amazon.com/IAM/latest/UserGuide/id_credentials_temp.html) via the `GetSessionToken` or `AssumeRole` API calls. These expire in a short period of time, so the risk of leaking credentials is reduced.
 
-Notice in the above environment how a session token gets written out. This is because `aws-vault` uses Amazon's STS service to generate [temporary credentials](https://docs.aws.amazon.com/IAM/latest/UserGuide/id_credentials_temp.html) via the `GetSessionToken` or `AssumeRole` API calls. These expire in a short period of time, so the risk of leaking credentials is reduced.
+AWS Vault then exposes the temporary credentials to the sub-process in one of two ways
 
-The credentials are exposed to the subprocess in one of two ways:
-
- * Environment variables are written to the sub-process.
-
- * Local [EC2 Instance Metadata server](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/ec2-instance-metadata.html) is started. This approach has the advantage that anything that uses Amazon's SDKs will automatically refresh credentials as needed, so session times can be as short as possible. The downside is that only one can run per host and because it binds to `169.254.169.254:80`, your sudo password is required.
+1. **Environment variables** are written to the sub-process. Notice in the below example how the AWS credentials get written out
+   ```shell
+   $ aws-vault exec jonsmith -- env | grep AWS
+   AWS_VAULT=jonsmith
+   AWS_DEFAULT_REGION=us-east-1
+   AWS_REGION=us-east-1
+   AWS_ACCESS_KEY_ID=%%%
+   AWS_SECRET_ACCESS_KEY=%%%
+   AWS_SESSION_TOKEN=%%%
+   AWS_SECURITY_TOKEN=%%%
+   AWS_SESSION_EXPIRATION=2020-04-16T11:16:27Z
+   ```
+2. **Local [EC2 Instance Metadata server](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/ec2-instance-metadata.html)** is started. This approach has the advantage that anything that uses Amazon's SDKs will automatically refresh credentials as needed, so session times can be as short as possible. The downside is that only one can run per host and because it binds to `169.254.169.254:80`, your sudo password is required.
 
 The default is to use environment variables, but you can opt-in to the local instance metadata server with the `--server` flag on the `exec` command.
 
@@ -88,35 +101,50 @@ region = us-east-1
 [profile jonsmith]
 mfa_serial = arn:aws:iam::111111111111:mfa/jonsmith
 
-[profile readonly]
+[profile foo-readonly]
+source_profile = jonsmith
 role_arn = arn:aws:iam::22222222222:role/ReadOnly
-source_profile = jonsmith
 
-[profile admin]
-role_arn = arn:aws:iam::22222222222:role/Administrator
+[profile foo-admin]
 source_profile = jonsmith
+role_arn = arn:aws:iam::22222222222:role/Administrator
 mfa_serial = arn:aws:iam::111111111111:mfa/jonsmith
 
-[profile otheraccount]
-role_arn = arn:aws:iam::333333333333:role/Administrator
+[profile bar-role1]
 source_profile = jonsmith
+role_arn = arn:aws:iam::333333333333:role/Role1
+mfa_serial = arn:aws:iam::111111111111:mfa/jonsmith
+
+[profile bar-role2]
+source_profile = bar-role1
+role_arn = arn:aws:iam::333333333333:role/Role2
 mfa_serial = arn:aws:iam::111111111111:mfa/jonsmith
 ```
 
-When you use the `readonly` profile, aws-vault will use the credentials found in the source_profile `jonsmith`, and  generate temporary credentials for the `ReadOnly` role using STS AssumeRole. When you use the `prod-admin` profile, aws-vault will first use `GetSessionToken` to establish an MFA session before an AssumeRole for `Administrator`. This MFA session is stored in your keychain so you only have to enter your MFA once, and using `otheraccount` will not cause another MFA prompt.
+Here's what you can expect from aws-vault 
 
+| Command                                  | Credentials                 | Cached        | MFA |
+|------------------------------------------|-----------------------------|---------------|-----|
+| `aws-vault exec jonsmith --no-session`   | Long-term credentials       | No            | No  |
+| `aws-vault exec jonsmith`                | session-token               | session-token | Yes |
+| `aws-vault exec foo-readonly`            | role                        | No            | No  |
+| `aws-vault exec foo-admin`               | session-token + role        | session-token | Yes |
+| `aws-vault exec foo-admin --duration=2h` | role                        | role          | Yes |
+| `aws-vault exec bar-role2`               | session-token + role + role | session-token | Yes |
+| `aws-vault exec bar-role2 --no-session`  | role + role                 | role          | Yes |
 
-## macOS Code Signing
+## Development
 
 The [macOS release builds](https://github.com/99designs/aws-vault/releases) are code-signed to avoid extra prompts in Keychain. You can verify this with:
+```shell
+$ codesign --verify --verbose $(which aws-vault)
+```
 
-    $ codesign --verify --verbose $(which aws-vault)
-
-If you are developing or compiling the aws-vault binary yourself, you can [generate a self-signed certificate](https://support.apple.com/en-au/guide/keychain-access/kyca8916/mac) by accessing Keychain Access > Certificate Assistant > Create Certificate > Code Signing Certificate. You can then sign your binary with:
-
-    $ go build .
-    $ codesign --sign "Name of my certificate" ./aws-vault
-
+If you are developing or compiling the aws-vault binary yourself, you can [generate a self-signed certificate](https://support.apple.com/en-au/guide/keychain-access/kyca8916/mac) by accessing Keychain Access > Certificate Assistant > Create Certificate -> Certificate Type: Code Signing. You can then sign your binary with:
+```shell
+$ go build .
+$ codesign --sign <Name of certificate created above> ./aws-vault
+```
 
 ## References and Inspiration
 

@@ -5,21 +5,21 @@ import (
 	"log"
 	"time"
 
-	"github.com/99designs/aws-vault/vault"
+	"github.com/99designs/aws-vault/v6/vault"
+	"github.com/99designs/keyring"
+	"github.com/alecthomas/kingpin"
 	"github.com/aws/aws-sdk-go/aws/credentials"
 	"github.com/aws/aws-sdk-go/aws/session"
 	"github.com/aws/aws-sdk-go/service/iam"
-	"gopkg.in/alecthomas/kingpin.v2"
 )
 
 type RotateCommandInput struct {
 	NoSession   bool
 	ProfileName string
-	Keyring     *vault.CredentialKeyring
 	Config      vault.Config
 }
 
-func ConfigureRotateCommand(app *kingpin.Application) {
+func ConfigureRotateCommand(app *kingpin.Application, a *AwsVault) {
 	input := RotateCommandInput{}
 
 	cmd := app.Command("rotate", "Rotates credentials")
@@ -30,30 +30,43 @@ func ConfigureRotateCommand(app *kingpin.Application) {
 
 	cmd.Arg("profile", "Name of the profile").
 		Required().
-		HintAction(awsConfigFile.ProfileNames).
+		HintAction(a.MustGetProfileNames).
 		StringVar(&input.ProfileName)
 
-	cmd.Action(func(c *kingpin.ParseContext) error {
-		input.Config.MfaPromptMethod = GlobalFlags.PromptDriver
-		input.Keyring = &vault.CredentialKeyring{Keyring: keyringImpl}
-		app.FatalIfError(RotateCommand(input), "rotate")
+	cmd.Action(func(c *kingpin.ParseContext) (err error) {
+		input.Config.MfaPromptMethod = a.PromptDriver
+		keyring, err := a.Keyring()
+		if err != nil {
+			return err
+		}
+		f, err := a.AwsConfigFile()
+		if err != nil {
+			return err
+		}
+
+		err = RotateCommand(input, f, keyring)
+		app.FatalIfError(err, "rotate")
 		return nil
 	})
 }
 
-func RotateCommand(input RotateCommandInput) error {
+func RotateCommand(input RotateCommandInput, f *vault.ConfigFile, keyring keyring.Keyring) error {
 	// Can't disable sessions completely, might need to use session for MFA-Protected API Access
 	vault.UseSession = !input.NoSession
 	vault.UseSessionCache = false
 
-	configLoader.BaseConfig = input.Config
-	configLoader.ActiveProfile = input.ProfileName
+	configLoader := &vault.ConfigLoader{
+		File:          f,
+		BaseConfig:    input.Config,
+		ActiveProfile: input.ProfileName,
+	}
 	config, err := configLoader.LoadFromProfile(input.ProfileName)
 	if err != nil {
 		return err
 	}
 
-	masterCredentialsName, err := vault.MasterCredentialsFor(input.ProfileName, input.Keyring, config)
+	ckr := &vault.CredentialKeyring{Keyring: keyring}
+	masterCredentialsName, err := vault.MasterCredentialsFor(input.ProfileName, ckr, config)
 	if err != nil {
 		return err
 	}
@@ -65,7 +78,7 @@ func RotateCommand(input RotateCommandInput) error {
 	}
 
 	// Get the existing credentials access key ID
-	oldMasterCreds, err := vault.NewMasterCredentials(input.Keyring, masterCredentialsName).Get()
+	oldMasterCreds, err := vault.NewMasterCredentials(ckr, masterCredentialsName).Get()
 	if err != nil {
 		return err
 	}
@@ -77,15 +90,15 @@ func RotateCommand(input RotateCommandInput) error {
 	// create a session to rotate the credentials
 	var sessCreds *credentials.Credentials
 	if input.NoSession {
-		sessCreds = vault.NewMasterCredentials(input.Keyring, config.ProfileName)
+		sessCreds = vault.NewMasterCredentials(ckr, config.ProfileName)
 	} else {
-		sessCreds, err = vault.NewTempCredentials(config, input.Keyring)
+		sessCreds, err = vault.NewTempCredentials(config, ckr)
 		if err != nil {
 			return fmt.Errorf("Error getting temporary credentials: %w", err)
 		}
 	}
 
-	sess, err := vault.NewSession(sessCreds, config.Region)
+	sess, err := vault.NewSessionWithCreds(sessCreds, config.Region, config.STSRegionalEndpoints)
 	if err != nil {
 		return err
 	}
@@ -110,16 +123,16 @@ func RotateCommand(input RotateCommandInput) error {
 		SecretAccessKey: *createOut.AccessKey.SecretAccessKey,
 	}
 
-	err = input.Keyring.Set(masterCredentialsName, newMasterCreds)
+	err = ckr.Set(masterCredentialsName, newMasterCreds)
 	if err != nil {
 		return fmt.Errorf("Error storing new access key %s: %w", vault.FormatKeyForDisplay(newMasterCreds.AccessKeyID), err)
 	}
 
 	// Delete old sessions
-	sessions := input.Keyring.Sessions()
+	sk := &vault.SessionKeyring{Keyring: ckr.Keyring}
 	profileNames, err := getProfilesInChain(input.ProfileName, configLoader)
 	for _, profileName := range profileNames {
-		if n, _ := sessions.Delete(profileName); n > 0 {
+		if n, _ := sk.RemoveForProfile(profileName); n > 0 {
 			fmt.Printf("Deleted %d sessions for %s\n", n, profileName)
 		}
 	}
